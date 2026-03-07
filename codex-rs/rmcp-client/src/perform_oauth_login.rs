@@ -490,13 +490,10 @@ impl OauthLoginFlow {
             &scope_refs,
             &redirect_uri,
             oauth_client_id,
+            oauth_resource,
         )
         .await?;
-        let auth_url = append_query_param(
-            &oauth_state.get_authorization_url().await?,
-            "resource",
-            oauth_resource,
-        );
+        let auth_url = oauth_state.get_authorization_url().await?;
         let timeout_secs = timeout_secs.unwrap_or(DEFAULT_OAUTH_TIMEOUT_SECS).max(1);
         let timeout = Duration::from_secs(timeout_secs as u64);
 
@@ -607,26 +604,66 @@ async fn start_authorization(
     scopes: &[&str],
     redirect_uri: &str,
     oauth_client_id: Option<&str>,
+    oauth_resource: Option<&str>,
 ) -> Result<OAuthState> {
-    let Some(oauth_client_id) = oauth_client_id.filter(|client_id| !client_id.trim().is_empty())
-    else {
+    let oauth_client_id = oauth_client_id.filter(|client_id| !client_id.trim().is_empty());
+    let resource_override = oauth_resource.and_then(|r| {
+        let trimmed = r.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+
+    // Fast path: no resource override and no explicit client id. Let rmcp drive
+    // discovery + DCR. rmcp uses `server_url` as the `resource` value for both
+    // the authorization URL and the token exchange, which matches RFC 8707 for
+    // the common case.
+    if resource_override.is_none()
+        && oauth_client_id.is_none()
+    {
         let mut oauth_state = OAuthState::new(server_url, Some(http_client)).await?;
         oauth_state
             .start_authorization(scopes, redirect_uri, Some("Codex"))
             .await?;
         return Ok(oauth_state);
-    };
+    }
 
-    let mut auth_manager = AuthorizationManager::new(server_url).await?;
+    // When a resource override is configured, rmcp's `exchange_code_for_token`
+    // also needs to send the override as the `resource` parameter — otherwise
+    // strict providers reject the token request as a resource mismatch. rmcp
+    // builds that value from `AuthorizationManager::base_url`, so we discover
+    // metadata against the real `server_url` and then construct the actual
+    // session manager with `base_url = oauth_resource` so both the
+    // authorization URL and the token exchange carry the override.
+    let mut discovery_manager = AuthorizationManager::new(server_url).await?;
+    discovery_manager.with_client(http_client.clone())?;
+    let metadata = discovery_manager.discover_metadata().await?;
+
+    let session_base_url = resource_override.unwrap_or(server_url);
+    let mut auth_manager = AuthorizationManager::new(session_base_url).await?;
     auth_manager.with_client(http_client)?;
-    let metadata = auth_manager.discover_metadata().await?;
     auth_manager.set_metadata(metadata);
-    auth_manager.configure_client(OAuthClientConfig {
-        client_id: oauth_client_id.to_string(),
-        client_secret: None,
-        scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
-        redirect_uri: redirect_uri.to_string(),
-    })?;
+
+    match oauth_client_id {
+        Some(client_id) => {
+            auth_manager.configure_client(OAuthClientConfig {
+                client_id: client_id.to_string(),
+                client_secret: None,
+                scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+                redirect_uri: redirect_uri.to_string(),
+            })?;
+        }
+        None => {
+            let mut config = auth_manager
+                .register_client("Codex", redirect_uri)
+                .await?;
+            config.scopes = scopes.iter().map(|scope| (*scope).to_string()).collect();
+            auth_manager.configure_client(config)?;
+        }
+    }
+
     let auth_url = auth_manager.get_authorization_url(scopes).await?;
 
     Ok(OAuthState::Session(AuthorizationSession {
@@ -636,6 +673,7 @@ async fn start_authorization(
     }))
 }
 
+#[allow(dead_code)]
 fn append_query_param(url: &str, key: &str, value: Option<&str>) -> String {
     let Some(value) = value else {
         return url.to_string();
@@ -718,6 +756,7 @@ mod tests {
             &[],
             "http://127.0.0.1/callback",
             Some("eci-prd-pub-codex-123"),
+            None,
         )
         .await
         .expect("start oauth authorization");

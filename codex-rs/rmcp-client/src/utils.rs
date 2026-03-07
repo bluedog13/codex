@@ -126,6 +126,28 @@ pub(crate) fn apply_default_headers(
     }
 }
 
+/// Build the local reqwest client that rmcp uses to fetch OAuth metadata.
+///
+/// rmcp 0.16 requires a reqwest 0.13 client, but `codex-client` still exposes
+/// only a reqwest 0.12 helper. This routes the rustls config from the shared
+/// `custom_ca` module into a reqwest 0.13 builder so `CODEX_CA_CERTIFICATE` /
+/// `SSL_CERT_FILE` continue to work for OAuth metadata discovery.
+pub(crate) fn build_oauth_metadata_client(
+    default_headers: &HeaderMap,
+) -> Result<reqwest::Client> {
+    let mut builder = apply_default_headers(reqwest::Client::builder(), default_headers);
+    if let Some(client_config) =
+        codex_client::maybe_build_rustls_client_config_with_custom_ca()
+            .map_err(|err| anyhow!("failed to load custom CA bundle: {err}"))?
+    {
+        builder = builder
+            .use_preconfigured_tls((*client_config).clone());
+    }
+    builder
+        .build()
+        .map_err(|err| anyhow!("failed to build OAuth metadata client: {err}"))
+}
+
 #[cfg(unix)]
 pub(crate) const DEFAULT_ENV_VARS: &[&str] = &[
     "HOME",
