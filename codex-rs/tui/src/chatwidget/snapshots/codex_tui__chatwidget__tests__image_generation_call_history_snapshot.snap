@@ -1,7 +1,7 @@
 ---
 source: tui/src/chatwidget/tests.rs
-assertion_line: 5889
 expression: combined
 ---
-• Generated Image
-  └ completed: A tiny blue square
+• Generated Image:
+  └ A tiny blue square
+  └ Saved to: file:///tmp/ig-1.png

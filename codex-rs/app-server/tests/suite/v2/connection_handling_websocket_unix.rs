@@ -3,7 +3,6 @@ use super::connection_handling_websocket::WsClient;
 use super::connection_handling_websocket::connect_websocket;
 use super::connection_handling_websocket::create_config_toml;
 use super::connection_handling_websocket::read_response_for_id;
-use super::connection_handling_websocket::reserve_local_addr;
 use super::connection_handling_websocket::send_initialize_request;
 use super::connection_handling_websocket::send_request;
 use super::connection_handling_websocket::spawn_websocket_server;
@@ -134,6 +133,34 @@ async fn websocket_transport_second_sigterm_forces_exit_while_turn_running() -> 
     Ok(())
 }
 
+#[tokio::test]
+async fn websocket_transport_repeated_sighup_keeps_waiting_for_running_turn() -> Result<()> {
+    let GracefulCtrlCFixture {
+        _codex_home,
+        _server,
+        mut process,
+        mut ws,
+    } = start_ctrl_c_restart_fixture(Duration::from_secs(3)).await?;
+
+    send_sighup(&process)?;
+    assert_process_does_not_exit_within(&mut process, Duration::from_millis(300)).await?;
+
+    send_sighup(&process)?;
+    assert_process_does_not_exit_within(&mut process, Duration::from_millis(300)).await?;
+
+    let status = wait_for_process_exit_within(
+        &mut process,
+        Duration::from_secs(10),
+        "timed out waiting for graceful repeated SIGHUP restart shutdown",
+    )
+    .await?;
+    assert!(status.success(), "expected graceful exit, got {status}");
+
+    expect_websocket_disconnect(&mut ws).await?;
+
+    Ok(())
+}
+
 struct GracefulCtrlCFixture {
     _codex_home: TempDir,
     _server: wiremock::MockServer,
@@ -154,20 +181,19 @@ async fn start_ctrl_c_restart_fixture(turn_delay: Duration) -> Result<GracefulCt
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri(), "never")?;
 
-    let bind_addr = reserve_local_addr()?;
-    let process = spawn_websocket_server(codex_home.path(), bind_addr).await?;
+    let (process, bind_addr) = spawn_websocket_server(codex_home.path()).await?;
     let mut ws = connect_websocket(bind_addr).await?;
 
-    send_initialize_request(&mut ws, 1, "ws_graceful_shutdown").await?;
-    let init_response = read_response_for_id(&mut ws, 1).await?;
+    send_initialize_request(&mut ws, /*id*/ 1, "ws_graceful_shutdown").await?;
+    let init_response = read_response_for_id(&mut ws, /*id*/ 1).await?;
     assert_eq!(init_response.id, RequestId::Integer(1));
 
-    send_thread_start_request(&mut ws, 2).await?;
-    let thread_start_response = read_response_for_id(&mut ws, 2).await?;
+    send_thread_start_request(&mut ws, /*id*/ 2).await?;
+    let thread_start_response = read_response_for_id(&mut ws, /*id*/ 2).await?;
     let ThreadStartResponse { thread, .. } = to_response(thread_start_response)?;
 
-    send_turn_start_request(&mut ws, 3, &thread.id).await?;
-    let turn_start_response = read_response_for_id(&mut ws, 3).await?;
+    send_turn_start_request(&mut ws, /*id*/ 3, &thread.id).await?;
+    let turn_start_response = read_response_for_id(&mut ws, /*id*/ 3).await?;
     assert_eq!(turn_start_response.id, RequestId::Integer(3));
 
     wait_for_responses_post(&server, Duration::from_secs(5)).await?;
@@ -236,6 +262,10 @@ fn send_sigint(process: &Child) -> Result<()> {
 
 fn send_sigterm(process: &Child) -> Result<()> {
     send_signal(process, "-TERM")
+}
+
+fn send_sighup(process: &Child) -> Result<()> {
+    send_signal(process, "-HUP")
 }
 
 fn send_signal(process: &Child, signal: &str) -> Result<()> {

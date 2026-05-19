@@ -3,11 +3,30 @@ use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
+use std::path::Path;
 
 use crate::markdown_render::COLON_LOCATION_SUFFIX_RE;
 use crate::markdown_render::HASH_LOCATION_SUFFIX_RE;
 use crate::markdown_render::render_markdown_text;
+use crate::markdown_render::render_markdown_text_with_width;
+use crate::markdown_render::render_markdown_text_with_width_and_cwd;
 use insta::assert_snapshot;
+
+fn render_markdown_text_for_cwd(input: &str, cwd: &Path) -> Text<'static> {
+    render_markdown_text_with_width_and_cwd(input, /*width*/ None, Some(cwd))
+}
+
+fn plain_lines(text: &Text<'_>) -> Vec<String> {
+    text.lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.clone())
+                .collect::<String>()
+        })
+        .collect()
+}
 
 #[test]
 fn empty() {
@@ -661,106 +680,138 @@ fn load_location_suffix_regexes() {
 
 #[test]
 fn file_link_hides_destination() {
-    let text = render_markdown_text(
+    let text = render_markdown_text_for_cwd(
         "[codex-rs/tui/src/markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs)",
+        Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from(Line::from_iter(["codex-rs/tui/src/markdown_render.rs".cyan()]));
+    let expected =
+        Text::from(Line::from_iter(["codex-rs/tui/src/markdown_render.rs".cyan()]));
+    assert_eq!(text, expected);
+}
+
+#[test]
+fn file_link_decodes_percent_encoded_bare_path_destination() {
+    let text = render_markdown_text_for_cwd(
+        "[report](/Users/example/code/codex/Example%20Folder/R%C3%A9sum%C3%A9/report.md)",
+        Path::new("/Users/example/code/codex"),
+    );
+    let expected = Text::from(Line::from_iter([
+        "Example Folder/Résumé/report.md".cyan(),
+    ]));
     assert_eq!(text, expected);
 }
 
 #[test]
 fn file_link_appends_line_number_when_label_lacks_it() {
-    let text = render_markdown_text(
+    let text = render_markdown_text_for_cwd(
         "[markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74)",
+        Path::new("/Users/example/code/codex"),
     );
     let expected = Text::from(Line::from_iter([
-        "markdown_render.rs".cyan(),
-        ":74".cyan(),
+        "codex-rs/tui/src/markdown_render.rs:74".cyan(),
     ]));
     assert_eq!(text, expected);
 }
 
 #[test]
-fn file_link_uses_label_for_line_number() {
-    let text = render_markdown_text(
-        "[markdown_render.rs:74](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74)",
+fn file_link_keeps_absolute_paths_outside_cwd() {
+    let text = render_markdown_text_for_cwd(
+        "[README.md:74](/Users/example/code/codex/README.md:74)",
+        Path::new("/Users/example/code/codex/codex-rs/tui"),
     );
-    let expected = Text::from(Line::from_iter(["markdown_render.rs:74".cyan()]));
+    let expected = Text::from(Line::from_iter(["/Users/example/code/codex/README.md:74".cyan()]));
     assert_eq!(text, expected);
 }
 
 #[test]
 fn file_link_appends_hash_anchor_when_label_lacks_it() {
-    let text = render_markdown_text(
+    let text = render_markdown_text_for_cwd(
         "[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)",
+        Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from(Line::from_iter([
-        "markdown_render.rs".cyan(),
-        ":74:3".cyan(),
-    ]));
+    let expected =
+        Text::from(Line::from_iter([
+            "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
+        ]));
     assert_eq!(text, expected);
 }
 
 #[test]
-fn file_link_uses_label_for_hash_anchor() {
-    let text = render_markdown_text(
+fn file_link_uses_target_path_for_hash_anchor() {
+    let text = render_markdown_text_for_cwd(
         "[markdown_render.rs#L74C3](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)",
+        Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from(Line::from_iter(["markdown_render.rs#L74C3".cyan()]));
+    let expected =
+        Text::from(Line::from_iter([
+            "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
+        ]));
     assert_eq!(text, expected);
 }
 
 #[test]
 fn file_link_appends_range_when_label_lacks_it() {
-    let text = render_markdown_text(
+    let text = render_markdown_text_for_cwd(
         "[markdown_render.rs](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74:3-76:9)",
+        Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from(Line::from_iter([
-        "markdown_render.rs".cyan(),
-        ":74:3-76:9".cyan(),
-    ]));
+    let expected =
+        Text::from(Line::from_iter([
+            "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
+        ]));
     assert_eq!(text, expected);
 }
 
 #[test]
-fn file_link_uses_label_for_range() {
-    let text = render_markdown_text(
+fn file_link_uses_target_path_for_range() {
+    let text = render_markdown_text_for_cwd(
         "[markdown_render.rs:74:3-76:9](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74:3-76:9)",
+        Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from(Line::from_iter(["markdown_render.rs:74:3-76:9".cyan()]));
+    let expected =
+        Text::from(Line::from_iter([
+            "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
+        ]));
     assert_eq!(text, expected);
 }
 
 #[test]
 fn file_link_appends_hash_range_when_label_lacks_it() {
-    let text = render_markdown_text(
+    let text = render_markdown_text_for_cwd(
         "[markdown_render.rs](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3-L76C9)",
+        Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from(Line::from_iter([
-        "markdown_render.rs".cyan(),
-        ":74:3-76:9".cyan(),
-    ]));
+    let expected =
+        Text::from(Line::from_iter([
+            "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
+        ]));
     assert_eq!(text, expected);
 }
 
 #[test]
 fn multiline_file_link_label_after_styled_prefix_does_not_panic() {
-    let text = render_markdown_text(
+    let text = render_markdown_text_for_cwd(
         "**bold** plain [foo\nbar](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3)",
+        Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from_iter([
-        Line::from_iter(["bold".bold(), " plain ".into(), "foo".cyan()]),
-        Line::from_iter(["bar".cyan(), ":74:3".cyan()]),
-    ]);
+    let expected = Text::from(Line::from_iter([
+        "bold".bold(),
+        " plain ".into(),
+        "codex-rs/tui/src/markdown_render.rs:74:3".cyan(),
+    ]));
     assert_eq!(text, expected);
 }
 
 #[test]
-fn file_link_uses_label_for_hash_range() {
-    let text = render_markdown_text(
+fn file_link_uses_target_path_for_hash_range() {
+    let text = render_markdown_text_for_cwd(
         "[markdown_render.rs#L74C3-L76C9](file:///Users/example/code/codex/codex-rs/tui/src/markdown_render.rs#L74C3-L76C9)",
+        Path::new("/Users/example/code/codex"),
     );
-    let expected = Text::from(Line::from_iter(["markdown_render.rs#L74C3-L76C9".cyan()]));
+    let expected =
+        Text::from(Line::from_iter([
+            "codex-rs/tui/src/markdown_render.rs:74:3-76:9".cyan(),
+        ]));
     assert_eq!(text, expected);
 }
 
@@ -778,8 +829,9 @@ fn url_link_shows_destination() {
 
 #[test]
 fn markdown_render_file_link_snapshot() {
-    let text = render_markdown_text(
+    let text = render_markdown_text_for_cwd(
         "See [markdown_render.rs:74](/Users/example/code/codex/codex-rs/tui/src/markdown_render.rs:74).",
+        Path::new("/Users/example/code/codex"),
     );
     let rendered = text
         .lines
@@ -794,6 +846,82 @@ fn markdown_render_file_link_snapshot() {
         .join("\n");
 
     assert_snapshot!(rendered);
+}
+
+#[test]
+fn unordered_list_local_file_link_stays_inline_with_following_text() {
+    let text = render_markdown_text_with_width_and_cwd(
+        "- [binary](/Users/example/code/codex/codex-rs/README.md:93): core is the agent/business logic, tui is the terminal UI, exec is the headless automation surface, and cli is the top-level multitool binary.",
+        Some(72),
+        Some(Path::new("/Users/example/code/codex")),
+    );
+    let rendered = text
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "- codex-rs/README.md:93: core is the agent/business logic, tui is the",
+            "  terminal UI, exec is the headless automation surface, and cli is the",
+            "  top-level multitool binary.",
+        ]
+    );
+}
+
+#[test]
+fn unordered_list_local_file_link_soft_break_before_colon_stays_inline() {
+    let text = render_markdown_text_with_width_and_cwd(
+        "- [binary](/Users/example/code/codex/codex-rs/README.md:93)\n  : core is the agent/business logic.",
+        Some(72),
+        Some(Path::new("/Users/example/code/codex")),
+    );
+    let rendered = text
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec!["- codex-rs/README.md:93: core is the agent/business logic.",]
+    );
+}
+
+#[test]
+fn consecutive_unordered_list_local_file_links_do_not_detach_paths() {
+    let text = render_markdown_text_with_width_and_cwd(
+        "- [binary](/Users/example/code/codex/codex-rs/README.md:93)\n  : cli is the top-level multitool binary.\n- [expectations](/Users/example/code/codex/codex-rs/core/README.md:1)\n  : codex-core owns the real runtime behavior.",
+        Some(72),
+        Some(Path::new("/Users/example/code/codex")),
+    );
+    let rendered = text
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "- codex-rs/README.md:93: cli is the top-level multitool binary.",
+            "- codex-rs/core/README.md:1: codex-core owns the real runtime behavior.",
+        ]
+    );
 }
 
 #[test]
@@ -1011,6 +1139,53 @@ fn code_block_inside_unordered_list_item_multiple_lines() {
         })
         .collect();
     assert_eq!(lines, vec!["- Item", "", "  first", "  second"]);
+}
+
+#[test]
+fn list_item_after_code_block_keeps_blank_separator() {
+    let md = "1. First:\n\n   ```rust\n   fn first() {}\n   ```\n\n2. Second:\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec!["1. First:", "", "   fn first() {}", "", "2. Second:"]
+    );
+    assert_snapshot!(
+        "list_item_after_code_block_keeps_blank_separator",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn outer_list_item_after_nested_code_block_keeps_blank_separator() {
+    let md = "1. First:\n   - Nested:\n\n     ```rust\n     fn first() {}\n     ```\n\n2. Second:\n";
+    let text = render_markdown_text(md);
+    let lines = plain_lines(&text);
+    assert_eq!(
+        lines,
+        vec![
+            "1. First:",
+            "    - Nested:",
+            "",
+            "      fn first() {}",
+            "",
+            "2. Second:",
+        ]
+    );
+}
+
+#[test]
+fn list_item_after_simple_item_stays_compact() {
+    let md = "1. First\n\n2. Second\n";
+    let text = render_markdown_text(md);
+    assert_eq!(plain_lines(&text), vec!["1. First", "2. Second"]);
+}
+
+#[test]
+fn mixed_url_markdown_wraps_prose_without_splitting_words_snapshot() {
+    let md = "This paragraph keeps **strikethrough** intact near a [link](https://example.com/path) while enough surrounding prose forces wrapping.";
+    let text = render_markdown_text_with_width(md, Some(/*width*/ 48));
+    assert_snapshot!(plain_lines(&text).join("\n"));
 }
 
 #[test]
@@ -1252,4 +1427,101 @@ fn code_block_preserves_trailing_blank_lines() {
         content[code_start + 1], "",
         "trailing blank line inside code fence was lost: {content:?}"
     );
+}
+
+#[test]
+fn table_renders_unicode_box() {
+    let md = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+    let text = render_markdown_text(md);
+    let lines: Vec<String> = text
+        .lines
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+
+    assert_eq!(
+        lines,
+        vec![
+            "┌─────┬─────┐".to_string(),
+            "│ A   │ B   │".to_string(),
+            "├─────┼─────┤".to_string(),
+            "│ 1   │ 2   │".to_string(),
+            "└─────┴─────┘".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn table_alignment_respects_markers() {
+    let md = "| Left | Center | Right |\n|:-----|:------:|------:|\n| a | b | c |\n";
+    let text = render_markdown_text(md);
+    let lines: Vec<String> = text
+        .lines
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+
+    assert_eq!(lines[1], "│ Left │ Center │ Right │");
+    assert_eq!(lines[3], "│ a    │   b    │     c │");
+}
+
+#[test]
+fn table_wraps_cell_content_when_width_is_narrow() {
+    let md = "| Key | Description |\n| --- | --- |\n| -v | Enable very verbose logging output for debugging |\n";
+    let text = crate::markdown_render::render_markdown_text_with_width(md, Some(30));
+    let lines: Vec<String> = text
+        .lines
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+
+    assert!(lines[0].starts_with('┌') && lines[0].ends_with('┐'));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("Enable very verbose"))
+            && lines.iter().any(|line| line.contains("logging output")),
+        "expected wrapped row content: {lines:?}"
+    );
+}
+
+#[test]
+fn table_inside_blockquote_has_quote_prefix() {
+    let md = "> | A | B |\n> |---|---|\n> | 1 | 2 |\n";
+    let text = render_markdown_text(md);
+    let lines: Vec<String> = text
+        .lines
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+
+    assert!(lines.iter().all(|line| line.starts_with("> ")));
+    assert!(lines.iter().any(|line| line.contains("┌─────┬─────┐")));
+}
+
+#[test]
+fn escaped_pipes_render_in_table_cells() {
+    let md = "| Col |\n| --- |\n| a \\| b |\n";
+    let text = render_markdown_text(md);
+    let lines: Vec<String> = text
+        .lines
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+
+    assert!(lines.iter().any(|line| line.contains("a | b")));
+}
+
+#[test]
+fn table_falls_back_to_pipe_rendering_if_it_cannot_fit() {
+    let md = "| c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 | c9 | c10 |\n|---|---|---|---|---|---|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |\n";
+    let text = crate::markdown_render::render_markdown_text_with_width(md, Some(20));
+    let lines: Vec<String> = text
+        .lines
+        .iter()
+        .map(|line| line.spans.iter().map(|span| span.content.clone()).collect())
+        .collect();
+
+    assert!(lines.first().is_some_and(|line| line.starts_with('|')));
+    assert!(!lines.iter().any(|line| line.contains('┌')));
 }

@@ -1,10 +1,15 @@
 #![cfg(not(target_os = "windows"))]
 
+use anyhow::Context;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_core::CodexAuth;
-use codex_core::features::Feature;
+use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+use codex_exec_server::REMOTE_ENVIRONMENT_ID;
+use codex_exec_server::RemoveOptions;
+use codex_login::CodexAuth;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ModelInfo;
@@ -13,34 +18,82 @@ use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::TruncationPolicyConfig;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxEntry;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
+use core_test_support::PathBufExt;
+use core_test_support::PathExt;
+use core_test_support::get_remote_test_env;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_custom_tool_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_models_once;
+use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
-use core_test_support::wait_for_event;
+use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event_with_timeout;
+use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageBuffer;
 use image::Rgba;
 use image::load_from_memory;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use serde_json::json;
+use std::fs;
+use std::io::Cursor;
+use std::path::PathBuf;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+use tempfile::TempDir;
 use tokio::time::Duration;
 use wiremock::BodyPrintLimit;
 use wiremock::MockServer;
+#[cfg(not(debug_assertions))]
+use wiremock::ResponseTemplate;
+#[cfg(not(debug_assertions))]
+use wiremock::matchers::body_string_contains;
+
+const VIEW_IMAGE_TURN_COMPLETE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn disabled_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) -> Op {
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.config.cwd.as_path());
+    Op::UserInput {
+        items,
+        environments: None,
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            cwd: Some(test.config.cwd.to_path_buf()),
+            approval_policy: Some(AskForApproval::Never),
+            sandbox_policy: Some(sandbox_policy),
+            permission_profile,
+            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                mode: codex_protocol::config_types::ModeKind::Default,
+                settings: codex_protocol::config_types::Settings {
+                    model,
+                    reasoning_effort: None,
+                    developer_instructions: None,
+                },
+            }),
+            ..Default::default()
+        },
+    }
+}
 
 fn image_messages(body: &Value) -> Vec<&Value> {
     body.get("input")
@@ -69,26 +122,73 @@ fn find_image_message(body: &Value) -> Option<&Value> {
     image_messages(body).into_iter().next()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
+fn png_bytes(width: u32, height: u32, rgba: [u8; 4]) -> anyhow::Result<Vec<u8>> {
+    let image = ImageBuffer::from_pixel(width, height, Rgba(rgba));
+    let mut cursor = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image).write_to(&mut cursor, image::ImageFormat::Png)?;
+    Ok(cursor.into_inner())
+}
 
+async fn create_workspace_directory(test: &TestCodex, rel_path: &str) -> anyhow::Result<PathBuf> {
+    let abs_path = test.config.cwd.join(rel_path);
+    test.fs()
+        .create_directory(
+            &abs_path,
+            CreateDirectoryOptions { recursive: true },
+            /*sandbox*/ None,
+        )
+        .await?;
+    Ok(abs_path.into_path_buf())
+}
+
+async fn write_workspace_file(
+    test: &TestCodex,
+    rel_path: &str,
+    contents: Vec<u8>,
+) -> anyhow::Result<PathBuf> {
+    let abs_path = test.config.cwd.join(rel_path);
+    if let Some(parent) = abs_path.parent() {
+        test.fs()
+            .create_directory(
+                &parent,
+                CreateDirectoryOptions { recursive: true },
+                /*sandbox*/ None,
+            )
+            .await?;
+    }
+    test.fs()
+        .write_file(&abs_path, contents, /*sandbox*/ None)
+        .await?;
+    Ok(abs_path.into_path_buf())
+}
+
+async fn write_workspace_png(
+    test: &TestCodex,
+    rel_path: &str,
+    width: u32,
+    height: u32,
+    rgba: [u8; 4],
+) -> anyhow::Result<PathBuf> {
+    write_workspace_file(test, rel_path, png_bytes(width, height, rgba)?).await
+}
+
+async fn assert_user_turn_local_image_resizes_to(
+    original_dimensions: (u32, u32),
+    expected_dimensions: (u32, u32),
+) -> anyhow::Result<()> {
     let server = start_mock_server().await;
 
+    let mut builder = test_codex();
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
         session_configured,
         ..
-    } = test_codex().build(&server).await?;
+    } = &test;
 
-    let rel_path = "user-turn/example.png";
-    let abs_path = cwd.path().join(rel_path);
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let original_width = 2304;
-    let original_height = 864;
+    let (original_width, original_height) = original_dimensions;
+    let local_image_dir = tempfile::tempdir()?;
+    let abs_path = local_image_dir.path().join("example.png");
     let image = ImageBuffer::from_pixel(original_width, original_height, Rgba([20u8, 40, 60, 255]));
     image.save(&abs_path)?;
 
@@ -102,34 +202,27 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::LocalImage {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::LocalImage {
                 path: abs_path.clone(),
+                detail: None,
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
     wait_for_event_with_timeout(
-        &codex,
+        codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
         // Empirically, image attachment can be slow under Bazel/RBE.
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
     let body = mock.single_request().body_json();
     let image_message =
-        find_image_message(&body).expect("pending input image message not included in request");
+        find_image_message(&body).context("pending input image message not included in request")?;
     let image_url = image_message
         .get("content")
         .and_then(Value::as_array)
@@ -142,24 +235,35 @@ async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
                 }
             })
         })
-        .expect("image_url present");
+        .context("image_url present")?;
 
     let (prefix, encoded) = image_url
         .split_once(',')
-        .expect("image url contains data prefix");
+        .context("image url contains data prefix")?;
     assert_eq!(prefix, "data:image/png;base64");
 
     let decoded = BASE64_STANDARD
         .decode(encoded)
-        .expect("image data decodes from base64 for request");
-    let resized = load_from_memory(&decoded).expect("load resized image");
+        .context("image data decodes from base64 for request")?;
+    let resized = load_from_memory(&decoded).context("load resized image")?;
     let (width, height) = resized.dimensions();
-    assert!(width <= 2048);
-    assert!(height <= 768);
-    assert!(width < original_width);
-    assert!(height < original_height);
+    assert_eq!((width, height), expected_dimensions);
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_with_local_image_attaches_image() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_user_turn_local_image_resizes_to((2304, 864), (2048, 768)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_with_vertical_local_image_resizes_to_square_bounds() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    assert_user_turn_local_image_resizes_to((1024, 4096), (512, 2048)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -167,23 +271,28 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-
+    let mut builder = test_codex();
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
         session_configured,
+        config,
         ..
-    } = test_codex().build(&server).await?;
+    } = &test;
+    let cwd = config.cwd.clone();
 
     let rel_path = "assets/example.png";
-    let abs_path = cwd.path().join(rel_path);
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let abs_path = cwd.join(rel_path);
     let original_width = 2304;
     let original_height = 864;
-    let image = ImageBuffer::from_pixel(original_width, original_height, Rgba([255u8, 0, 0, 255]));
-    image.save(&abs_path)?;
+    write_workspace_png(
+        &test,
+        rel_path,
+        original_width,
+        original_height,
+        [255u8, 0, 0, 255],
+    )
+    .await?;
 
     let call_id = "view-image-call";
     let arguments = serde_json::json!({ "path": rel_path }).to_string();
@@ -204,30 +313,36 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
                 text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
-    let mut tool_event = None;
+    let mut item_started = None;
+    let mut item_completed = None;
+    let mut legacy_event = None;
     wait_for_event_with_timeout(
-        &codex,
+        codex,
         |event| match event {
-            EventMsg::ViewImageToolCall(_) => {
-                tool_event = Some(event.clone());
+            EventMsg::ItemStarted(event) => {
+                if matches!(&event.item, codex_protocol::items::TurnItem::ImageView(_)) {
+                    item_started = Some(event.item.clone());
+                }
+                false
+            }
+            EventMsg::ItemCompleted(event) => {
+                if matches!(&event.item, codex_protocol::items::TurnItem::ImageView(_)) {
+                    item_completed = Some(event.item.clone());
+                }
+                false
+            }
+            EventMsg::ViewImageToolCall(event) => {
+                legacy_event = Some(event.clone());
                 false
             }
             EventMsg::TurnComplete(_) => true,
@@ -235,16 +350,27 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         },
         // Empirically, we have seen this run slow when run under
         // Bazel on arm Linux.
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
-    let tool_event = match tool_event.expect("view image tool event emitted") {
-        EventMsg::ViewImageToolCall(event) => event,
-        _ => unreachable!("stored event must be ViewImageToolCall"),
-    };
-    assert_eq!(tool_event.call_id, call_id);
-    assert_eq!(tool_event.path, abs_path);
+    match item_started.expect("view image item started event emitted") {
+        codex_protocol::items::TurnItem::ImageView(item) => {
+            assert_eq!(item.id, call_id);
+            assert_eq!(item.path, abs_path);
+        }
+        other => panic!("expected ImageView item, got {other:?}"),
+    }
+    match item_completed.expect("view image item completed event emitted") {
+        codex_protocol::items::TurnItem::ImageView(item) => {
+            assert_eq!(item.id, call_id);
+            assert_eq!(item.path, abs_path);
+        }
+        other => panic!("expected ImageView item, got {other:?}"),
+    }
+    let legacy_event = legacy_event.expect("legacy view image event emitted");
+    assert_eq!(legacy_event.call_id, call_id);
+    assert_eq!(legacy_event.path, abs_path);
 
     let req = mock.single_request();
     let body = req.body_json();
@@ -283,46 +409,286 @@ async fn view_image_tool_attaches_local_image() -> anyhow::Result<()> {
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert!(resized_width <= 2048);
-    assert!(resized_height <= 768);
-    assert!(resized_width < original_width);
-    assert!(resized_height < original_height);
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_tool_can_preserve_original_resolution_on_gpt5_3_codex() -> anyhow::Result<()> {
+async fn view_image_routes_to_selected_local_environment() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex()
-        .with_model("gpt-5.3-codex")
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::ImageDetailOriginal)
-                .expect("test config should allow feature update");
+    let mut builder = test_codex();
+    let test = builder.build(&server).await?;
+    write_workspace_file(
+        &test,
+        "local.png",
+        png_bytes(/*width*/ 1, /*height*/ 1, [0, 255, 0, 255])?,
+    )
+    .await?;
+    let call_id = "call-view-image-local-env";
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    call_id,
+                    "view_image",
+                    &json!({
+                        "path": "local.png",
+                        "environment_id": LOCAL_ENVIRONMENT_ID,
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    test.submit_turn_with_environments(
+        "route local view image",
+        Some(vec![TurnEnvironmentSelection {
+            environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+            cwd: test.config.cwd.clone(),
+        }]),
+    )
+    .await?;
+
+    let output = response_mock
+        .last_request()
+        .context("missing request containing local view_image output")?
+        .function_call_output(call_id);
+    let output_items = output
+        .get("output")
+        .and_then(Value::as_array)
+        .context("view_image output should be content items")?;
+    assert_eq!(output_items.len(), 1);
+    let image_url = output_items[0]
+        .get("image_url")
+        .and_then(Value::as_str)
+        .context("view_image output should include image_url")?;
+    assert!(
+        image_url.starts_with("data:image/png;base64,"),
+        "unexpected image_url: {image_url}",
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_tool_applies_local_sandbox_read_denies() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let test = builder.build(&server).await?;
+    let rel_path = "denied.png";
+    let denied_path = test.config.cwd.join(rel_path);
+    write_workspace_file(
+        &test,
+        rel_path,
+        png_bytes(/*width*/ 1, /*height*/ 1, [0, 255, 0, 255])?,
+    )
+    .await?;
+    let call_id = "call-view-image-outside-cwd";
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    call_id,
+                    "view_image",
+                    &json!({ "path": rel_path }).to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut file_system_sandbox_policy = FileSystemSandboxPolicy::default();
+    file_system_sandbox_policy
+        .entries
+        .push(FileSystemSandboxEntry {
+            path: FileSystemPath::Path {
+                path: denied_path.clone(),
+            },
+            access: FileSystemAccessMode::None,
         });
+    let permission_profile = PermissionProfile::from_runtime_permissions(
+        &file_system_sandbox_policy,
+        NetworkSandboxPolicy::Restricted,
+    );
+
+    test.submit_turn_with_permission_profile("attach the denied image", permission_profile)
+        .await?;
+
+    let request = response_mock
+        .last_request()
+        .context("missing request containing sandboxed view_image output")?;
+    assert!(
+        request.inputs_of_type("input_image").is_empty(),
+        "sandboxed local view_image should not attach denied images"
+    );
+    let output_text = request
+        .function_call_output_content_and_success(call_id)
+        .and_then(|(content, _)| content)
+        .context("sandboxed view_image error text present")?;
+    let expected_locate_prefix = format!("unable to locate image at `{}`:", denied_path.display());
+    let expected_read_prefix = format!("unable to read image at `{}`:", denied_path.display());
+    assert!(
+        output_text.starts_with(&expected_locate_prefix)
+            || output_text.starts_with(&expected_read_prefix),
+        "expected error to start with `{expected_locate_prefix}` or `{expected_read_prefix}` but got `{output_text}`"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_routes_to_selected_remote_environment() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let Some(_remote_env) = get_remote_test_env() else {
+        return Ok(());
+    };
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let test = builder.build_with_remote_and_local_env(&server).await?;
+    let local_cwd = TempDir::new()?;
+    fs::write(local_cwd.path().join("remote.png"), b"not a remote image")?;
+    let local_selection = TurnEnvironmentSelection {
+        environment_id: LOCAL_ENVIRONMENT_ID.to_string(),
+        cwd: local_cwd.path().abs(),
+    };
+    let remote_cwd = PathBuf::from(format!(
+        "/tmp/codex-view-image-routing-{}",
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
+    ))
+    .abs();
+    let image_path = remote_cwd.join("remote.png");
+    test.fs()
+        .create_directory(
+            &remote_cwd,
+            CreateDirectoryOptions { recursive: true },
+            /*sandbox*/ None,
+        )
+        .await?;
+    let png = png_bytes(/*width*/ 1, /*height*/ 1, [0, 255, 0, 255])?;
+    test.fs()
+        .write_file(&image_path, png, /*sandbox*/ None)
+        .await?;
+    let remote_selection = TurnEnvironmentSelection {
+        environment_id: REMOTE_ENVIRONMENT_ID.to_string(),
+        cwd: remote_cwd.clone(),
+    };
+    let call_id = "call-view-image-multi-env";
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    call_id,
+                    "view_image",
+                    &json!({
+                        "path": "remote.png",
+                        "environment_id": REMOTE_ENVIRONMENT_ID,
+                    })
+                    .to_string(),
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-2"),
+            ]),
+        ],
+    )
+    .await;
+
+    test.submit_turn_with_environments(
+        "route view image",
+        Some(vec![local_selection, remote_selection]),
+    )
+    .await?;
+
+    let output = response_mock
+        .last_request()
+        .context("missing request containing view_image output")?
+        .function_call_output(call_id)
+        .clone();
+    let output_items = output
+        .get("output")
+        .and_then(Value::as_array)
+        .context("view_image output should be content items")?;
+    assert_eq!(output_items.len(), 1);
+    let image_url = output_items[0]
+        .get("image_url")
+        .and_then(Value::as_str)
+        .context("view_image output should include image_url")?;
+    assert!(
+        image_url.starts_with("data:image/png;base64,"),
+        "unexpected image_url: {image_url}",
+    );
+
+    test.fs()
+        .remove(
+            &remote_cwd,
+            RemoveOptions {
+                recursive: true,
+                force: true,
+            },
+            /*sandbox*/ None,
+        )
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_tool_can_preserve_original_resolution_when_requested_on_gpt5_3_codex()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
         session_configured,
         ..
-    } = builder.build(&server).await?;
+    } = &test;
 
     let rel_path = "assets/original-example.png";
-    let abs_path = cwd.path().join(rel_path);
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let original_width = 2304;
     let original_height = 864;
-    let image = ImageBuffer::from_pixel(original_width, original_height, Rgba([0u8, 80, 255, 255]));
-    image.save(&abs_path)?;
+    write_workspace_png(
+        &test,
+        rel_path,
+        original_width,
+        original_height,
+        [0u8, 80, 255, 255],
+    )
+    .await?;
 
     let call_id = "view-image-original";
-    let arguments = serde_json::json!({ "path": rel_path }).to_string();
+    let arguments = serde_json::json!({ "path": rel_path, "detail": "original" }).to_string();
 
     let first_response = sse(vec![
         ev_response_created("resp-1"),
@@ -340,28 +706,20 @@ async fn view_image_tool_can_preserve_original_resolution_on_gpt5_3_codex() -> a
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
                 text: "please add the original screenshot".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            service_tier: None,
-            summary: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
     wait_for_event_with_timeout(
-        &codex,
+        codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
@@ -396,32 +754,197 @@ async fn view_image_tool_can_preserve_original_resolution_on_gpt5_3_codex() -> a
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_tool_keeps_legacy_behavior_below_gpt5_3_codex() -> anyhow::Result<()> {
+async fn view_image_tool_errors_clearly_for_unsupported_detail_values() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
-        config
-            .features
-            .enable(Feature::ImageDetailOriginal)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
         session_configured,
         ..
-    } = builder.build(&server).await?;
+    } = &test;
 
-    let rel_path = "assets/original-example-lower-model.png";
-    let abs_path = cwd.path().join(rel_path);
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let rel_path = "assets/unsupported-detail.png";
+    write_workspace_png(
+        &test,
+        rel_path,
+        /*width*/ 256,
+        /*height*/ 128,
+        [0u8, 80, 255, 255],
+    )
+    .await?;
+
+    let call_id = "view-image-unsupported-detail";
+    let arguments = serde_json::json!({ "path": rel_path, "detail": "low" }).to_string();
+
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call(call_id, "view_image", &arguments),
+        ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, first_response).await;
+
+    let second_response = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+    let mock = responses::mount_sse_once(&server, second_response).await;
+
+    let session_model = session_configured.model.clone();
+
+    codex
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
+                text: "please attach the image at low detail".into(),
+                text_elements: Vec::new(),
+            }],
+            session_model,
+        ))
+        .await?;
+
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
+
+    let req = mock.single_request();
+    let body_with_tool_output = req.body_json();
+    let output_text = req
+        .function_call_output_content_and_success(call_id)
+        .and_then(|(content, _)| content)
+        .expect("output text present");
+    assert_eq!(
+        output_text,
+        "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `low`"
+    );
+
+    assert!(
+        find_image_message(&body_with_tool_output).is_none(),
+        "unsupported detail values should not produce an input_image message"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_tool_treats_null_detail_as_omitted() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
+    let test = builder.build_with_remote_env(&server).await?;
+    let TestCodex {
+        codex,
+        session_configured,
+        ..
+    } = &test;
+
+    let rel_path = "assets/null-detail.png";
     let original_width = 2304;
     let original_height = 864;
-    let image = ImageBuffer::from_pixel(original_width, original_height, Rgba([0u8, 80, 255, 255]));
-    image.save(&abs_path)?;
+    write_workspace_png(
+        &test,
+        rel_path,
+        original_width,
+        original_height,
+        [0u8, 80, 255, 255],
+    )
+    .await?;
+
+    let call_id = "view-image-null-detail";
+    let arguments = serde_json::json!({ "path": rel_path, "detail": null }).to_string();
+
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call(call_id, "view_image", &arguments),
+        ev_completed("resp-1"),
+    ]);
+    responses::mount_sse_once(&server, first_response).await;
+
+    let second_response = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+    let mock = responses::mount_sse_once(&server, second_response).await;
+
+    let session_model = session_configured.model.clone();
+
+    codex
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
+                text: "please attach the image with a null detail".into(),
+                text_elements: Vec::new(),
+            }],
+            session_model,
+        ))
+        .await?;
+
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
+
+    let req = mock.single_request();
+    let function_output = req.function_call_output(call_id);
+    let output_items = function_output
+        .get("output")
+        .and_then(Value::as_array)
+        .expect("function_call_output should be a content item array");
+    assert_eq!(output_items.len(), 1);
+    assert_eq!(
+        output_items[0].get("detail").and_then(Value::as_str),
+        Some("high")
+    );
+    let image_url = output_items[0]
+        .get("image_url")
+        .and_then(Value::as_str)
+        .expect("image_url present");
+
+    let (_, encoded) = image_url
+        .split_once(',')
+        .expect("image url contains data prefix");
+    let decoded = BASE64_STANDARD
+        .decode(encoded)
+        .expect("image data decodes from base64 for request");
+    let resized = load_from_memory(&decoded).expect("load resized image");
+    let (width, height) = resized.dimensions();
+    assert_eq!((width, height), (2048, 768));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn view_image_tool_resizes_when_model_lacks_original_detail_support() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.2");
+    let test = builder.build_with_remote_env(&server).await?;
+    let TestCodex {
+        codex,
+        session_configured,
+        ..
+    } = &test;
+
+    let rel_path = "assets/original-example-lower-model.png";
+    let original_width = 2304;
+    let original_height = 864;
+    write_workspace_png(
+        &test,
+        rel_path,
+        original_width,
+        original_height,
+        [0u8, 80, 255, 255],
+    )
+    .await?;
 
     let call_id = "view-image-original-lower-model";
     let arguments = serde_json::json!({ "path": rel_path }).to_string();
@@ -442,28 +965,20 @@ async fn view_image_tool_keeps_legacy_behavior_below_gpt5_3_codex() -> anyhow::R
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
                 text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            service_tier: None,
-            summary: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
     wait_for_event_with_timeout(
-        &codex,
+        codex,
         |event| matches!(event, EventMsg::TurnComplete(_)),
-        Duration::from_secs(10),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
 
@@ -474,7 +989,10 @@ async fn view_image_tool_keeps_legacy_behavior_below_gpt5_3_codex() -> anyhow::R
         .and_then(Value::as_array)
         .expect("function_call_output should be a content item array");
     assert_eq!(output_items.len(), 1);
-    assert_eq!(output_items[0].get("detail"), None);
+    assert_eq!(
+        output_items[0].get("detail").and_then(Value::as_str),
+        Some("high")
+    );
 
     let image_url = output_items[0]
         .get("image_url")
@@ -491,49 +1009,43 @@ async fn view_image_tool_keeps_legacy_behavior_below_gpt5_3_codex() -> anyhow::R
         .expect("image data decodes from base64 for request");
     let resized = load_from_memory(&decoded).expect("load resized image");
     let (resized_width, resized_height) = resized.dimensions();
-    assert!(resized_width <= 2048);
-    assert!(resized_height <= 768);
-    assert!(resized_width < original_width);
-    assert!(resized_height < original_height);
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn js_repl_emit_image_attaches_local_image() -> anyhow::Result<()> {
+async fn view_image_tool_does_not_force_original_resolution_with_capability_only()
+-> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::JsRepl)
-            .expect("test config should allow feature update");
-    });
+    let mut builder = test_codex().with_model("gpt-5.3-codex");
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
         session_configured,
         ..
-    } = builder.build(&server).await?;
+    } = &test;
 
-    let call_id = "js-repl-view-image";
-    let js_input = r#"
-const fs = await import("node:fs/promises");
-const path = await import("node:path");
-const imagePath = path.join(codex.tmpDir, "js-repl-view-image.png");
-const png = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
-  "base64"
-);
-await fs.writeFile(imagePath, png);
-const out = await codex.tool("view_image", { path: imagePath });
-await codex.emitImage(out);
-"#;
+    let rel_path = "assets/original-example-capability-only.png";
+    let original_width = 2304;
+    let original_height = 864;
+    write_workspace_png(
+        &test,
+        rel_path,
+        original_width,
+        original_height,
+        [0u8, 80, 255, 255],
+    )
+    .await?;
+
+    let call_id = "view-image-capability-only";
+    let arguments = serde_json::json!({ "path": rel_path }).to_string();
 
     let first_response = sse(vec![
         ev_response_created("resp-1"),
-        ev_custom_tool_call(call_id, "js_repl", js_input),
+        ev_function_call(call_id, "view_image", &arguments),
         ev_completed("resp-1"),
     ]);
     responses::mount_sse_once(&server, first_response).await;
@@ -545,177 +1057,50 @@ await codex.emitImage(out);
     let mock = responses::mount_sse_once(&server, second_response).await;
 
     let session_model = session_configured.model.clone();
+
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
-                text: "use js_repl to write an image and attach it".into(),
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
+                text: "please add the screenshot".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
-    let mut tool_event = None;
     wait_for_event_with_timeout(
-        &codex,
-        |event| match event {
-            EventMsg::ViewImageToolCall(_) => {
-                tool_event = Some(event.clone());
-                false
-            }
-            EventMsg::TurnComplete(_) => true,
-            _ => false,
-        },
-        Duration::from_secs(10),
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
     )
     .await;
-    let tool_event = match tool_event {
-        Some(EventMsg::ViewImageToolCall(event)) => event,
-        other => panic!("expected ViewImageToolCall event, got {other:?}"),
-    };
-    assert!(
-        tool_event.path.ends_with("js-repl-view-image.png"),
-        "unexpected image path: {}",
-        tool_event.path.display()
-    );
 
     let req = mock.single_request();
-    let body = req.body_json();
-    assert_eq!(
-        image_messages(&body).len(),
-        0,
-        "js_repl view_image should not inject a pending input image message"
-    );
-
-    let custom_output = req.custom_tool_call_output(call_id);
-    let output_items = custom_output
+    let function_output = req.function_call_output(call_id);
+    let output_items = function_output
         .get("output")
         .and_then(Value::as_array)
-        .expect("custom_tool_call_output should be a content item array");
-    let image_url = output_items
-        .iter()
-        .find_map(|item| {
-            (item.get("type").and_then(Value::as_str) == Some("input_image"))
-                .then(|| item.get("image_url").and_then(Value::as_str))
-                .flatten()
-        })
-        .expect("image_url present in js_repl custom tool output");
-    assert!(
-        image_url.starts_with("data:image/png;base64,"),
-        "expected png data URL, got {image_url}"
+        .expect("function_call_output should be a content item array");
+    assert_eq!(output_items.len(), 1);
+    assert_eq!(
+        output_items[0].get("detail").and_then(Value::as_str),
+        Some("high")
     );
+    let image_url = output_items[0]
+        .get("image_url")
+        .and_then(Value::as_str)
+        .expect("image_url present");
 
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn js_repl_view_image_requires_explicit_emit() -> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    #[allow(clippy::expect_used)]
-    let mut builder = test_codex().with_config(|config| {
-        config
-            .features
-            .enable(Feature::JsRepl)
-            .expect("test config should allow feature update");
-    });
-    let TestCodex {
-        codex,
-        cwd,
-        session_configured,
-        ..
-    } = builder.build(&server).await?;
-
-    let call_id = "js-repl-view-image-no-emit";
-    let js_input = r#"
-const fs = await import("node:fs/promises");
-const path = await import("node:path");
-const imagePath = path.join(codex.tmpDir, "js-repl-view-image-no-emit.png");
-const png = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
-  "base64"
-);
-await fs.writeFile(imagePath, png);
-const out = await codex.tool("view_image", { path: imagePath });
-console.log(out.type);
-"#;
-
-    let first_response = sse(vec![
-        ev_response_created("resp-1"),
-        ev_custom_tool_call(call_id, "js_repl", js_input),
-        ev_completed("resp-1"),
-    ]);
-    responses::mount_sse_once(&server, first_response).await;
-
-    let second_response = sse(vec![
-        ev_assistant_message("msg-1", "done"),
-        ev_completed("resp-2"),
-    ]);
-    let mock = responses::mount_sse_once(&server, second_response).await;
-
-    let session_model = session_configured.model.clone();
-    codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
-                text: "use js_repl to write an image but do not emit it".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            service_tier: None,
-            summary: None,
-            collaboration_mode: None,
-            personality: None,
-        })
-        .await?;
-
-    let mut tool_event = None;
-    wait_for_event_with_timeout(
-        &codex,
-        |event| match event {
-            EventMsg::ViewImageToolCall(_) => {
-                tool_event = Some(event.clone());
-                false
-            }
-            EventMsg::TurnComplete(_) => true,
-            _ => false,
-        },
-        Duration::from_secs(10),
-    )
-    .await;
-    let tool_event = match tool_event {
-        Some(EventMsg::ViewImageToolCall(event)) => event,
-        other => panic!("expected ViewImageToolCall event, got {other:?}"),
-    };
-    assert!(
-        tool_event.path.ends_with("js-repl-view-image-no-emit.png"),
-        "unexpected image path: {}",
-        tool_event.path.display()
-    );
-
-    let req = mock.single_request();
-    let custom_output = req.custom_tool_call_output(call_id);
-    let output_items = custom_output.get("output").and_then(Value::as_array);
-    assert!(
-        output_items.is_none_or(|items| items
-            .iter()
-            .all(|item| item.get("type").and_then(Value::as_str) != Some("input_image"))),
-        "nested view_image should not auto-populate js_repl output"
-    );
+    let (_, encoded) = image_url
+        .split_once(',')
+        .expect("image url contains data prefix");
+    let decoded = BASE64_STANDARD
+        .decode(encoded)
+        .expect("image data decodes from base64 for request");
+    let resized = load_from_memory(&decoded).expect("load resized image");
+    let (resized_width, resized_height) = resized.dimensions();
+    assert_eq!((resized_width, resized_height), (2048, 768));
 
     Ok(())
 }
@@ -726,16 +1111,16 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
+    let mut builder = test_codex();
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
         session_configured,
         ..
-    } = test_codex().build(&server).await?;
+    } = &test;
 
     let rel_path = "assets";
-    let abs_path = cwd.path().join(rel_path);
-    std::fs::create_dir_all(&abs_path)?;
+    let abs_path = create_workspace_directory(&test, rel_path).await?;
 
     let call_id = "view-image-directory";
     let arguments = serde_json::json!({ "path": rel_path }).to_string();
@@ -756,25 +1141,22 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
                 text: "please attach the folder".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let req = mock.single_request();
     let body_with_tool_output = req.body_json();
@@ -794,24 +1176,22 @@ async fn view_image_tool_errors_when_path_is_directory() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_image_tool_placeholder_for_non_image_files() -> anyhow::Result<()> {
+async fn view_image_tool_errors_for_non_image_files() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
 
+    let mut builder = test_codex();
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
         session_configured,
         ..
-    } = test_codex().build(&server).await?;
+    } = &test;
 
     let rel_path = "assets/example.json";
-    let abs_path = cwd.path().join(rel_path);
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&abs_path, br#"{ "message": "hello" }"#)?;
+    let abs_path =
+        write_workspace_file(&test, rel_path, br#"{ "message": "hello" }"#.to_vec()).await?;
 
     let call_id = "view-image-non-image";
     let arguments = serde_json::json!({ "path": rel_path }).to_string();
@@ -832,59 +1212,41 @@ async fn view_image_tool_placeholder_for_non_image_files() -> anyhow::Result<()>
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
                 text: "please use the view_image tool to read the json file".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let request = mock.single_request();
     assert!(
         request.inputs_of_type("input_image").is_empty(),
         "non-image file should not produce an input_image message"
     );
-    let function_output = request.function_call_output(call_id);
-    let output_items = function_output
-        .get("output")
-        .and_then(Value::as_array)
-        .expect("function_call_output should be a content item array");
-    assert_eq!(
-        output_items.len(),
-        1,
-        "non-image placeholder should be returned as a single content item"
-    );
-    assert_eq!(
-        output_items[0].get("type").and_then(Value::as_str),
-        Some("input_text"),
-        "non-image placeholder should be returned as input_text"
-    );
-    let placeholder = output_items[0]
-        .get("text")
-        .and_then(Value::as_str)
-        .expect("placeholder text present");
+    let (error_text, success) = request
+        .function_call_output_content_and_success(call_id)
+        .expect("function_call_output should be present");
+    assert_eq!(success, None);
+    let error_text = error_text.expect("error text present");
 
-    assert!(
-        placeholder.contains("Codex could not read the local image at")
-            && placeholder.contains("unsupported MIME type `application/json`"),
-        "placeholder should describe the unsupported file type: {placeholder}"
+    let expected_error = format!(
+        "unable to process image at `{}`: unsupported image `application/json`",
+        abs_path.display()
     );
     assert!(
-        placeholder.contains(&abs_path.display().to_string()),
-        "placeholder should mention path: {placeholder}"
+        error_text.contains(&expected_error),
+        "error should describe unsupported file type: {error_text}"
     );
 
     Ok(())
@@ -896,15 +1258,17 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
 
     let server = start_mock_server().await;
 
+    let mut builder = test_codex();
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
+        config,
         session_configured,
         ..
-    } = test_codex().build(&server).await?;
+    } = &test;
 
     let rel_path = "missing/example.png";
-    let abs_path = cwd.path().join(rel_path);
+    let abs_path = config.cwd.join(rel_path);
 
     let call_id = "view-image-missing";
     let arguments = serde_json::json!({ "path": rel_path }).to_string();
@@ -925,25 +1289,22 @@ async fn view_image_tool_errors_when_file_missing() -> anyhow::Result<()> {
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
                 text: "please attach the missing image".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let req = mock.single_request();
     let body_with_tool_output = req.body_json();
@@ -991,9 +1352,11 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         visibility: ModelVisibility::List,
         supported_in_api: true,
         input_modalities: vec![InputModality::Text],
-        prefer_websockets: false,
         used_fallback_model_metadata: false,
+        supports_search_tool: false,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
+        service_tiers: Vec::new(),
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -1004,10 +1367,11 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
+        max_context_window: None,
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
@@ -1020,21 +1384,23 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
     )
     .await;
 
-    let TestCodex { codex, cwd, .. } = test_codex()
+    let mut builder = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config.model = Some(model_slug.to_string());
-        })
-        .build(&server)
-        .await?;
+        });
+    let test = builder.build_with_remote_env(&server).await?;
+    let TestCodex { codex, .. } = &test;
 
     let rel_path = "assets/example.png";
-    let abs_path = cwd.path().join(rel_path);
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let image = ImageBuffer::from_pixel(20, 20, Rgba([255u8, 0, 0, 255]));
-    image.save(&abs_path)?;
+    write_workspace_png(
+        &test,
+        rel_path,
+        /*width*/ 20,
+        /*height*/ 20,
+        [255u8, 0, 0, 255],
+    )
+    .await?;
 
     let call_id = "view-image-unsupported-model";
     let arguments = serde_json::json!({ "path": rel_path }).to_string();
@@ -1052,25 +1418,22 @@ async fn view_image_tool_returns_unsupported_message_for_text_only_model() -> an
     let mock = responses::mount_sse_once(&server, second_response).await;
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::Text {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::Text {
                 text: "please attach the image".into(),
                 text_elements: Vec::new(),
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: model_slug.to_string(),
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            model_slug.to_string(),
+        ))
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let output_text = mock
         .single_request()
@@ -1112,42 +1475,36 @@ async fn replaces_invalid_local_image_after_bad_request() -> anyhow::Result<()> 
 
     let completion_mock = responses::mount_sse_once(&server, success_response).await;
 
+    let mut builder = test_codex();
+    let test = builder.build_with_remote_env(&server).await?;
     let TestCodex {
         codex,
-        cwd,
         session_configured,
         ..
-    } = test_codex().build(&server).await?;
+    } = &test;
 
     let rel_path = "assets/poisoned.png";
-    let abs_path = cwd.path().join(rel_path);
-    if let Some(parent) = abs_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let image = ImageBuffer::from_pixel(1024, 512, Rgba([10u8, 20, 30, 255]));
-    image.save(&abs_path)?;
+    let abs_path = write_workspace_png(&test, rel_path, 1024, 512, [10u8, 20, 30, 255]).await?;
 
     let session_model = session_configured.model.clone();
 
     codex
-        .submit(Op::UserTurn {
-            items: vec![UserInput::LocalImage {
+        .submit(disabled_user_turn(
+            &test,
+            vec![UserInput::LocalImage {
                 path: abs_path.clone(),
+                detail: None,
             }],
-            final_output_json_schema: None,
-            cwd: cwd.path().to_path_buf(),
-            approval_policy: AskForApproval::Never,
-            sandbox_policy: SandboxPolicy::DangerFullAccess,
-            model: session_model,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
+            session_model,
+        ))
         .await?;
 
-    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        &codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        VIEW_IMAGE_TURN_COMPLETE_TIMEOUT,
+    )
+    .await;
 
     let first_body = invalid_image_mock.single_request().body_json();
     assert!(

@@ -6,8 +6,8 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use codex_core::config::Config;
-use codex_protocol::protocol::Op;
+use crate::app_command::AppCommand;
+use crate::legacy_core::config::Config;
 use serde::Serialize;
 use serde_json::json;
 
@@ -88,10 +88,7 @@ pub(crate) fn maybe_init(config: &Config) {
     let path = if let Ok(path) = std::env::var("CODEX_TUI_SESSION_LOG_PATH") {
         PathBuf::from(path)
     } else {
-        let mut p = match codex_core::config::log_dir(config) {
-            Ok(dir) => dir,
-            Err(_) => std::env::temp_dir(),
-        };
+        let mut p = config.log_dir.clone();
         let filename = format!(
             "session-{}.jsonl",
             chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
@@ -125,9 +122,6 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 
     match event {
-        AppEvent::CodexEvent(ev) => {
-            write_record("to_tui", "codex_event", ev);
-        }
         AppEvent::NewSession => {
             let value = json!({
                 "ts": now_ts(),
@@ -172,6 +166,33 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
             });
             LOGGER.write_json_line(value);
         }
+        AppEvent::PetPreviewLoaded { request_id, result } => {
+            let value = json!({
+                "ts": now_ts(),
+                "dir": "to_tui",
+                "kind": "app_event",
+                "variant": "PetPreviewLoaded",
+                "request_id": request_id,
+                "ok": result.is_ok(),
+            });
+            LOGGER.write_json_line(value);
+        }
+        AppEvent::PetSelectionLoaded {
+            request_id,
+            pet_id,
+            result,
+        } => {
+            let value = json!({
+                "ts": now_ts(),
+                "dir": "to_tui",
+                "kind": "app_event",
+                "variant": "PetSelectionLoaded",
+                "request_id": request_id,
+                "pet_id": pet_id,
+                "ok": result.is_ok(),
+            });
+            LOGGER.write_json_line(value);
+        }
         // Noise or control flow – record variant only
         other => {
             let value = json!({
@@ -185,7 +206,7 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
     }
 }
 
-pub(crate) fn log_outbound_op(op: &Op) {
+pub(crate) fn log_outbound_op(op: &AppCommand) {
     if !LOGGER.is_enabled() {
         return;
     }

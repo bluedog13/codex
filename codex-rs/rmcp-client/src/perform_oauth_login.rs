@@ -7,22 +7,29 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::ClientBuilder;
 use reqwest::Url;
+use rmcp::transport::AuthorizationManager;
+use rmcp::transport::AuthorizationSession;
+use rmcp::transport::auth::OAuthClientConfig;
 use rmcp::transport::auth::OAuthState;
+use sha2::Digest;
+use sha2::Sha256;
 use tiny_http::Response;
 use tiny_http::Server;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use urlencoding::decode;
 
-use crate::OAuthCredentialsStoreMode;
 use crate::StoredOAuthTokens;
 use crate::WrappedOAuthTokenResponse;
 use crate::oauth::compute_expires_at_millis;
 use crate::save_oauth_tokens;
 use crate::utils::apply_default_headers;
 use crate::utils::build_default_headers;
+use codex_config::types::OAuthCredentialsStoreMode;
 
 struct OauthHeaders {
     http_headers: Option<HashMap<String, String>>,
@@ -39,6 +46,36 @@ impl Drop for CallbackServerGuard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthProviderError {
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+impl OAuthProviderError {
+    pub fn new(error: Option<String>, error_description: Option<String>) -> Self {
+        Self {
+            error,
+            error_description,
+        }
+    }
+}
+
+impl std::fmt::Display for OAuthProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.error.as_deref(), self.error_description.as_deref()) {
+            (Some(error), Some(error_description)) => {
+                write!(f, "OAuth provider returned `{error}`: {error_description}")
+            }
+            (Some(error), None) => write!(f, "OAuth provider returned `{error}`"),
+            (None, Some(error_description)) => write!(f, "OAuth error: {error_description}"),
+            (None, None) => write!(f, "OAuth provider returned an error"),
+        }
+    }
+}
+
+impl std::error::Error for OAuthProviderError {}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn perform_oauth_login(
     server_name: &str,
@@ -47,9 +84,69 @@ pub async fn perform_oauth_login(
     http_headers: Option<HashMap<String, String>>,
     env_http_headers: Option<HashMap<String, String>>,
     scopes: &[String],
+    oauth_client_id: Option<&str>,
     oauth_resource: Option<&str>,
     callback_port: Option<u16>,
     callback_url: Option<&str>,
+) -> Result<()> {
+    perform_oauth_login_with_browser_output(
+        server_name,
+        server_url,
+        store_mode,
+        http_headers,
+        env_http_headers,
+        scopes,
+        oauth_client_id,
+        oauth_resource,
+        callback_port,
+        callback_url,
+        /*emit_browser_url*/ true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn perform_oauth_login_silent(
+    server_name: &str,
+    server_url: &str,
+    store_mode: OAuthCredentialsStoreMode,
+    http_headers: Option<HashMap<String, String>>,
+    env_http_headers: Option<HashMap<String, String>>,
+    scopes: &[String],
+    oauth_client_id: Option<&str>,
+    oauth_resource: Option<&str>,
+    callback_port: Option<u16>,
+    callback_url: Option<&str>,
+) -> Result<()> {
+    perform_oauth_login_with_browser_output(
+        server_name,
+        server_url,
+        store_mode,
+        http_headers,
+        env_http_headers,
+        scopes,
+        oauth_client_id,
+        oauth_resource,
+        callback_port,
+        callback_url,
+        /*emit_browser_url*/ false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_oauth_login_with_browser_output(
+    server_name: &str,
+    server_url: &str,
+    store_mode: OAuthCredentialsStoreMode,
+    http_headers: Option<HashMap<String, String>>,
+    env_http_headers: Option<HashMap<String, String>>,
+    scopes: &[String],
+    oauth_client_id: Option<&str>,
+    oauth_resource: Option<&str>,
+    callback_port: Option<u16>,
+    callback_url: Option<&str>,
+    emit_browser_url: bool,
 ) -> Result<()> {
     let headers = OauthHeaders {
         http_headers,
@@ -61,14 +158,15 @@ pub async fn perform_oauth_login(
         store_mode,
         headers,
         scopes,
+        oauth_client_id,
         oauth_resource,
-        true,
+        /*launch_browser*/ true,
         callback_port,
         callback_url,
-        None,
+        /*timeout_secs*/ None,
     )
     .await?
-    .finish()
+    .finish(emit_browser_url)
     .await
 }
 
@@ -80,6 +178,7 @@ pub async fn perform_oauth_login_return_url(
     http_headers: Option<HashMap<String, String>>,
     env_http_headers: Option<HashMap<String, String>>,
     scopes: &[String],
+    oauth_client_id: Option<&str>,
     oauth_resource: Option<&str>,
     timeout_secs: Option<i64>,
     callback_port: Option<u16>,
@@ -95,8 +194,9 @@ pub async fn perform_oauth_login_return_url(
         store_mode,
         headers,
         scopes,
+        oauth_client_id,
         oauth_resource,
-        false,
+        /*launch_browser*/ false,
         callback_port,
         callback_url,
         timeout_secs,
@@ -111,7 +211,7 @@ pub async fn perform_oauth_login_return_url(
 
 fn spawn_callback_server(
     server: Arc<Server>,
-    tx: oneshot::Sender<(String, String)>,
+    tx: oneshot::Sender<CallbackResult>,
     expected_callback_path: String,
 ) {
     tokio::task::spawn_blocking(move || {
@@ -125,17 +225,22 @@ fn spawn_callback_server(
                     if let Err(err) = request.respond(response) {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
-                    if let Err(err) = tx.send((code, state)) {
+                    if let Err(err) =
+                        tx.send(CallbackResult::Success(OauthCallbackResult { code, state }))
+                    {
                         eprintln!("Failed to send OAuth callback: {err:?}");
                     }
                     break;
                 }
-                CallbackOutcome::Error(description) => {
-                    let response = Response::from_string(format!("OAuth error: {description}"))
-                        .with_status_code(400);
+                CallbackOutcome::Error(error) => {
+                    let response = Response::from_string(error.to_string()).with_status_code(400);
                     if let Err(err) = request.respond(response) {
                         eprintln!("Failed to respond to OAuth callback: {err}");
                     }
+                    if let Err(err) = tx.send(CallbackResult::Error(error)) {
+                        eprintln!("Failed to send OAuth callback error: {err:?}");
+                    }
+                    break;
                 }
                 CallbackOutcome::Invalid => {
                     let response =
@@ -149,14 +254,22 @@ fn spawn_callback_server(
     });
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OauthCallbackResult {
     code: String,
     state: String,
 }
 
+#[derive(Debug)]
+enum CallbackResult {
+    Success(OauthCallbackResult),
+    Error(OAuthProviderError),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum CallbackOutcome {
     Success(OauthCallbackResult),
-    Error(String),
+    Error(OAuthProviderError),
     Invalid,
 }
 
@@ -170,6 +283,7 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
 
     let mut code = None;
     let mut state = None;
+    let mut error = None;
     let mut error_description = None;
 
     for pair in query.split('&') {
@@ -183,6 +297,7 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
         match key {
             "code" => code = Some(decoded),
             "state" => state = Some(decoded),
+            "error" => error = Some(decoded),
             "error_description" => error_description = Some(decoded),
             _ => {}
         }
@@ -192,8 +307,8 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
         return CallbackOutcome::Success(OauthCallbackResult { code, state });
     }
 
-    if let Some(description) = error_description {
-        return CallbackOutcome::Error(description);
+    if error.is_some() || error_description.is_some() {
+        return CallbackOutcome::Error(OAuthProviderError::new(error, error_description));
     }
 
     CallbackOutcome::Invalid
@@ -230,7 +345,7 @@ impl OauthLoginHandle {
 struct OauthLoginFlow {
     auth_url: String,
     oauth_state: OAuthState,
-    rx: oneshot::Receiver<(String, String)>,
+    rx: oneshot::Receiver<CallbackResult>,
     guard: CallbackServerGuard,
     server_name: String,
     server_url: String,
@@ -278,6 +393,31 @@ fn resolve_redirect_uri(server: &Server, callback_url: Option<&str>) -> Result<S
     Ok(callback_url.to_string())
 }
 
+fn callback_id_from_server_url(server_url: &str) -> Result<String> {
+    let mut parsed =
+        Url::parse(server_url).with_context(|| format!("invalid MCP server URL `{server_url}`"))?;
+    parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("MCP server URL `{server_url}` must include a host"))?;
+    parsed.set_fragment(None);
+
+    let digest = Sha256::digest(parsed.as_str().as_bytes());
+    Ok(URL_SAFE_NO_PAD.encode(&digest[..9]))
+}
+
+fn append_callback_id_to_redirect_uri(redirect_uri: &str, callback_id: &str) -> Result<String> {
+    let mut parsed = Url::parse(redirect_uri)
+        .with_context(|| format!("invalid redirect URI `{redirect_uri}`"))?;
+    let path = parsed.path();
+    let new_path = if path.ends_with('/') {
+        format!("{path}{callback_id}")
+    } else {
+        format!("{path}/{callback_id}")
+    };
+    parsed.set_path(&new_path);
+    Ok(parsed.to_string())
+}
+
 fn callback_path_from_redirect_uri(redirect_uri: &str) -> Result<String> {
     let parsed = Url::parse(redirect_uri)
         .with_context(|| format!("invalid redirect URI `{redirect_uri}`"))?;
@@ -307,6 +447,7 @@ impl OauthLoginFlow {
         store_mode: OAuthCredentialsStoreMode,
         headers: OauthHeaders,
         scopes: &[String],
+        oauth_client_id: Option<&str>,
         oauth_resource: Option<&str>,
         launch_browser: bool,
         callback_port: Option<u16>,
@@ -328,6 +469,8 @@ impl OauthLoginFlow {
         };
 
         let redirect_uri = resolve_redirect_uri(&server, callback_url)?;
+        let callback_id = callback_id_from_server_url(server_url)?;
+        let redirect_uri = append_callback_id_to_redirect_uri(&redirect_uri, &callback_id)?;
         let callback_path = callback_path_from_redirect_uri(&redirect_uri)?;
 
         let (tx, rx) = oneshot::channel();
@@ -340,16 +483,17 @@ impl OauthLoginFlow {
         let default_headers = build_default_headers(http_headers, env_http_headers)?;
         let http_client = apply_default_headers(ClientBuilder::new(), &default_headers).build()?;
 
-        let mut oauth_state = OAuthState::new(server_url, Some(http_client)).await?;
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-        oauth_state
-            .start_authorization(&scope_refs, &redirect_uri, Some("Codex"))
-            .await?;
-        let auth_url = append_query_param(
-            &oauth_state.get_authorization_url().await?,
-            "resource",
+        let oauth_state = start_authorization(
+            server_url,
+            http_client,
+            &scope_refs,
+            &redirect_uri,
+            oauth_client_id,
             oauth_resource,
-        );
+        )
+        .await?;
+        let auth_url = oauth_state.get_authorization_url().await?;
         let timeout_secs = timeout_secs.unwrap_or(DEFAULT_OAUTH_TIMEOUT_SECS).max(1);
         let timeout = Duration::from_secs(timeout_secs as u64);
 
@@ -370,24 +514,38 @@ impl OauthLoginFlow {
         self.auth_url.clone()
     }
 
-    async fn finish(mut self) -> Result<()> {
+    async fn finish(mut self, emit_browser_url: bool) -> Result<()> {
         if self.launch_browser {
             let server_name = &self.server_name;
             let auth_url = &self.auth_url;
-            println!(
-                "Authorize `{server_name}` by opening this URL in your browser:\n{auth_url}\n"
-            );
+            if emit_browser_url {
+                println!(
+                    "Authorize `{server_name}` by opening this URL in your browser:\n{auth_url}\n"
+                );
+            }
 
             if webbrowser::open(auth_url).is_err() {
-                println!("(Browser launch failed; please copy the URL above manually.)");
+                if !emit_browser_url {
+                    eprintln!(
+                        "Authorize `{server_name}` by opening this URL in your browser:\n{auth_url}\n"
+                    );
+                }
+                eprintln!("(Browser launch failed; please copy the URL above manually.)");
             }
         }
 
         let result = async {
-            let (code, csrf_state) = timeout(self.timeout, &mut self.rx)
+            let callback = timeout(self.timeout, &mut self.rx)
                 .await
                 .context("timed out waiting for OAuth callback")?
                 .context("OAuth callback was cancelled")?;
+            let OauthCallbackResult {
+                code,
+                state: csrf_state,
+            } = match callback {
+                CallbackResult::Success(callback) => callback,
+                CallbackResult::Error(error) => return Err(anyhow!(error)),
+            };
 
             self.oauth_state
                 .handle_callback(&code, &csrf_state)
@@ -425,7 +583,7 @@ impl OauthLoginFlow {
         let (tx, rx) = oneshot::channel();
 
         tokio::spawn(async move {
-            let result = self.finish().await;
+            let result = self.finish(/*emit_browser_url*/ false).await;
 
             if let Err(err) = &result {
                 eprintln!(
@@ -440,6 +598,82 @@ impl OauthLoginFlow {
     }
 }
 
+async fn start_authorization(
+    server_url: &str,
+    http_client: reqwest::Client,
+    scopes: &[&str],
+    redirect_uri: &str,
+    oauth_client_id: Option<&str>,
+    oauth_resource: Option<&str>,
+) -> Result<OAuthState> {
+    let oauth_client_id = oauth_client_id.filter(|client_id| !client_id.trim().is_empty());
+    let resource_override = oauth_resource.and_then(|r| {
+        let trimmed = r.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+
+    // Fast path: no resource override and no explicit client id. Let rmcp drive
+    // discovery + DCR. rmcp uses `server_url` as the `resource` value for both
+    // the authorization URL and the token exchange, which matches RFC 8707 for
+    // the common case.
+    if resource_override.is_none()
+        && oauth_client_id.is_none()
+    {
+        let mut oauth_state = OAuthState::new(server_url, Some(http_client)).await?;
+        oauth_state
+            .start_authorization(scopes, redirect_uri, Some("Codex"))
+            .await?;
+        return Ok(oauth_state);
+    }
+
+    // When a resource override is configured, rmcp's `exchange_code_for_token`
+    // also needs to send the override as the `resource` parameter — otherwise
+    // strict providers reject the token request as a resource mismatch. rmcp
+    // builds that value from `AuthorizationManager::base_url`, so we discover
+    // metadata against the real `server_url` and then construct the actual
+    // session manager with `base_url = oauth_resource` so both the
+    // authorization URL and the token exchange carry the override.
+    let mut discovery_manager = AuthorizationManager::new(server_url).await?;
+    discovery_manager.with_client(http_client.clone())?;
+    let metadata = discovery_manager.discover_metadata().await?;
+
+    let session_base_url = resource_override.unwrap_or(server_url);
+    let mut auth_manager = AuthorizationManager::new(session_base_url).await?;
+    auth_manager.with_client(http_client)?;
+    auth_manager.set_metadata(metadata);
+
+    match oauth_client_id {
+        Some(client_id) => {
+            auth_manager.configure_client(OAuthClientConfig {
+                client_id: client_id.to_string(),
+                client_secret: None,
+                scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+                redirect_uri: redirect_uri.to_string(),
+            })?;
+        }
+        None => {
+            let mut config = auth_manager
+                .register_client("Codex", redirect_uri)
+                .await?;
+            config.scopes = scopes.iter().map(|scope| (*scope).to_string()).collect();
+            auth_manager.configure_client(config)?;
+        }
+    }
+
+    let auth_url = auth_manager.get_authorization_url(scopes).await?;
+
+    Ok(OAuthState::Session(AuthorizationSession {
+        auth_manager,
+        auth_url,
+        redirect_uri: redirect_uri.to_string(),
+    }))
+}
+
+#[allow(dead_code)]
 fn append_query_param(url: &str, key: &str, value: Option<&str>) -> String {
     let Some(value) = value else {
         return url.to_string();
@@ -459,12 +693,86 @@ fn append_query_param(url: &str, key: &str, value: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use axum::Json;
+    use axum::Router;
+    use axum::routing::get;
     use pretty_assertions::assert_eq;
+    use reqwest::Url;
+    use serde_json::json;
+    use tokio::net::TcpListener;
 
     use super::CallbackOutcome;
+    use super::OAuthProviderError;
+    use super::append_callback_id_to_redirect_uri;
     use super::append_query_param;
+    use super::callback_id_from_server_url;
     use super::callback_path_from_redirect_uri;
     use super::parse_oauth_callback;
+    use super::start_authorization;
+
+    async fn spawn_oauth_metadata_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata listener");
+        let addr = listener.local_addr().expect("read metadata listener addr");
+        let base_url = format!("http://{addr}");
+        let metadata = json!({
+            "authorization_endpoint": format!("{base_url}/oauth/authorize"),
+            "token_endpoint": format!("{base_url}/oauth/token"),
+            "scopes_supported": [""],
+        });
+        let path_scoped_metadata = metadata.clone();
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server/mcp",
+                get(move || {
+                    let metadata = path_scoped_metadata.clone();
+                    async move { Json(metadata) }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(move || {
+                    let metadata = metadata.clone();
+                    async move { Json(metadata) }
+                }),
+            );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve oauth metadata");
+        });
+
+        base_url
+    }
+
+    #[tokio::test]
+    async fn start_authorization_uses_configured_client_id() {
+        let base_url = spawn_oauth_metadata_server().await;
+        let oauth_state = start_authorization(
+            &format!("{base_url}/mcp"),
+            reqwest::Client::new(),
+            &[],
+            "http://127.0.0.1/callback",
+            Some("eci-prd-pub-codex-123"),
+            None,
+        )
+        .await
+        .expect("start oauth authorization");
+
+        let authorization_url = oauth_state
+            .get_authorization_url()
+            .await
+            .expect("read authorization url");
+        let auth_url = Url::parse(&authorization_url).expect("authorization url should parse");
+        let client_id = auth_url
+            .query_pairs()
+            .find(|(key, _)| key == "client_id")
+            .map(|(_, value)| value.into_owned());
+
+        assert_eq!(client_id.as_deref(), Some("eci-prd-pub-codex-123"));
+    }
 
     #[test]
     fn parse_oauth_callback_accepts_default_path() {
@@ -479,9 +787,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_oauth_callback_accepts_callback_id_path() {
+        let parsed =
+            parse_oauth_callback("/callback/abc123?code=abc&state=xyz", "/callback/abc123");
+        assert!(matches!(parsed, CallbackOutcome::Success(_)));
+    }
+
+    #[test]
+    fn parse_oauth_callback_rejects_missing_callback_id_path() {
+        let parsed = parse_oauth_callback("/callback?code=abc&state=xyz", "/callback/abc123");
+        assert!(matches!(parsed, CallbackOutcome::Invalid));
+    }
+
+    #[test]
     fn parse_oauth_callback_rejects_wrong_path() {
         let parsed = parse_oauth_callback("/callback?code=abc&state=xyz", "/oauth/callback");
         assert!(matches!(parsed, CallbackOutcome::Invalid));
+    }
+
+    #[test]
+    fn parse_oauth_callback_returns_provider_error() {
+        let parsed = parse_oauth_callback(
+            "/callback?error=invalid_scope&error_description=scope%20rejected",
+            "/callback",
+        );
+
+        assert_eq!(
+            parsed,
+            CallbackOutcome::Error(OAuthProviderError::new(
+                Some("invalid_scope".to_string()),
+                Some("scope rejected".to_string()),
+            ))
+        );
     }
 
     #[test]
@@ -489,6 +826,55 @@ mod tests {
         let path = callback_path_from_redirect_uri("https://example.com/oauth/callback")
             .expect("redirect URI should parse");
         assert_eq!(path, "/oauth/callback");
+    }
+
+    #[test]
+    fn callback_id_is_bound_to_server_url() {
+        let callback_id = callback_id_from_server_url("https://mcp.example.com/mcp?tenant=one")
+            .expect("server URL should parse");
+        let same_without_fragment =
+            callback_id_from_server_url("https://mcp.example.com/mcp?tenant=one#unused")
+                .expect("server URL should parse");
+        let different_path = callback_id_from_server_url("https://mcp.example.com/sse?tenant=one")
+            .expect("server URL should parse");
+        let different_query = callback_id_from_server_url("https://mcp.example.com/mcp?tenant=two")
+            .expect("server URL should parse");
+        let different_origin = callback_id_from_server_url("https://mcp.example.com:8443/mcp")
+            .expect("server URL should parse");
+
+        assert_eq!(callback_id, same_without_fragment);
+        assert_ne!(callback_id, different_path);
+        assert_ne!(callback_id, different_query);
+        assert_ne!(callback_id, different_origin);
+        assert_eq!(callback_id.len(), 12);
+        assert!(
+            callback_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        );
+    }
+
+    #[test]
+    fn callback_id_is_appended_to_redirect_uri_path() {
+        let redirect_uri =
+            append_callback_id_to_redirect_uri("http://127.0.0.1:1234/callback", "abc123")
+                .expect("redirect URI should parse");
+
+        assert_eq!(redirect_uri, "http://127.0.0.1:1234/callback/abc123");
+    }
+
+    #[test]
+    fn callback_id_is_appended_before_redirect_uri_query() {
+        let redirect_uri = append_callback_id_to_redirect_uri(
+            "https://callbacks.example.com/oauth/callback?provider=github",
+            "abc123",
+        )
+        .expect("redirect URI should parse");
+
+        assert_eq!(
+            redirect_uri,
+            "https://callbacks.example.com/oauth/callback/abc123?provider=github"
+        );
     }
 
     #[test]

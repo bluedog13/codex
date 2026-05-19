@@ -56,6 +56,8 @@ pub enum SetupErrorCode {
     HelperFirewallComInitFailed,
     /// Helper failed to access firewall policy or rule collections.
     HelperFirewallPolicyAccessFailed,
+    /// Helper detected that local firewall policy changes will not fully take effect.
+    HelperFirewallPolicyIneffective,
     /// Helper failed to create, update, or add the firewall rule.
     HelperFirewallRuleCreateOrAddFailed,
     /// Helper failed to verify the configured firewall rule scope.
@@ -91,6 +93,7 @@ impl SetupErrorCode {
             Self::HelperCapabilitySidFailed => "helper_capability_sid_failed",
             Self::HelperFirewallComInitFailed => "helper_firewall_com_init_failed",
             Self::HelperFirewallPolicyAccessFailed => "helper_firewall_policy_access_failed",
+            Self::HelperFirewallPolicyIneffective => "helper_firewall_policy_ineffective",
             Self::HelperFirewallRuleCreateOrAddFailed => {
                 "helper_firewall_rule_create_or_add_failed"
             }
@@ -189,15 +192,16 @@ pub fn sanitize_setup_metric_tag_value(value: &str) -> String {
 
 fn redact_home_paths(value: &str) -> String {
     let mut usernames: Vec<String> = Vec::new();
-    if let Ok(username) = std::env::var("USERNAME") {
-        if !username.trim().is_empty() {
-            usernames.push(username);
-        }
+    if let Ok(username) = std::env::var("USERNAME")
+        && !username.trim().is_empty()
+    {
+        usernames.push(username);
     }
-    if let Ok(user) = std::env::var("USER") {
-        if !user.trim().is_empty() && !usernames.iter().any(|v| v.eq_ignore_ascii_case(&user)) {
-            usernames.push(user);
-        }
+    if let Ok(user) = std::env::var("USER")
+        && !user.trim().is_empty()
+        && !usernames.iter().any(|v| v.eq_ignore_ascii_case(&user))
+    {
+        usernames.push(user);
     }
 
     redact_username_segments(value, &usernames)

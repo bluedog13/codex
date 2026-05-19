@@ -2,8 +2,8 @@
 
 `codex-otel` is the OpenTelemetry integration crate for Codex. It provides:
 
-- Provider wiring for log/trace/metric exporters (`codex_otel::OtelProvider`,
-  `codex_otel::provider`, and the compatibility shim `codex_otel::otel_provider`).
+- Provider wiring for log/trace/metric exporters (`codex_otel::OtelProvider`
+  and `codex_otel::provider`).
 - Session-scoped business event emission via `codex_otel::SessionTelemetry`.
 - Low-level metrics APIs via `codex_otel::metrics`.
 - Trace-context helpers via `codex_otel::trace_context` and crate-root re-exports.
@@ -39,6 +39,8 @@ let settings = OtelSettings {
         tls: None,
     },
     metrics_exporter: OtelExporter::None,
+    span_attributes: std::collections::BTreeMap::new(),
+    tracestate: std::collections::BTreeMap::new(),
 };
 
 if let Some(provider) = OtelProvider::from(&settings)? {
@@ -48,6 +50,26 @@ if let Some(provider) = OtelProvider::from(&settings)? {
     registry.init();
 }
 ```
+
+Configured span attributes and W3C tracestate member fields are applied to
+exported trace spans and propagated trace context:
+
+```toml
+[otel.span_attributes]
+"example.trace_attr" = "enabled"
+
+[otel.tracestate.example]
+alpha = "one"
+beta = "two"
+```
+
+Configured tracestate members and encoded values must be valid W3C tracestate.
+Each nested table is encoded as semicolon-separated `key:value` fields inside
+that member. If propagated trace context already has the named member, Codex
+upserts configured fields and preserves other fields in that member. This
+config shape does not support setting opaque tracestate member values. Invalid
+trace metadata entries are ignored during config load and reported as startup
+warnings.
 
 ## SessionTelemetry (events)
 
